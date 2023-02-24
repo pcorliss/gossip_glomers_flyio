@@ -25,7 +25,10 @@ func main() {
 
 	var topology Topology = nil
 
-	n.Handle("broadcast_ok", func(msg maelstrom.Message) error { return nil })
+	var unacknowledged map[string][]int = make(map[string][]int)
+	var unacknowledgedMutex = sync.RWMutex{}
+
+	// n.Handle("broadcast_ok", func(msg maelstrom.Message) error { return nil })
 
 	// {
 	// 	"type": "broadcast",
@@ -44,29 +47,46 @@ func main() {
 		response["type"] = "broadcast_ok"
 
 		var num int = int(body["message"].(float64))
+		messageMutex.Lock()
 		if messageSet[num] {
 			// If we already have this number skip re-broadcasting
+			messageMutex.Unlock()
 			return n.Reply(msg, response)
 		}
 
-		messageMutex.Lock()
-		messages = append(messages, int(body["message"].(float64)))
+		messages = append(messages, num)
 		messageSet[num] = true
 		messageMutex.Unlock()
 
 		// rebroadcast to topology neighbors
-		// but exclude the sender
-		var neighbors = topology[n.ID()]
-		for _, neighbor := range neighbors {
-			if neighbor == msg.Src {
+		for _, neighbor := range topology[n.ID()] {
+
+			// Just broadcast to every other node except src and self
+			// for _, neighbor := range n.NodeIDs() {
+			if neighbor == msg.Src || neighbor == n.ID() {
+				// but exclude the sender
 				continue
 			}
-			n.Send(neighbor, msg.Body)
-			// n.RPC(neighbor, msg.Body, func(msg maelstrom.Message) error {
-			// 	var neighborResponse map[string]string = make(map[string]string)
-			// 	neighborResponse["type"] = "broadcast_ok"
-			// 	return n.Reply(msg, neighborResponse)
-			// })
+
+			// var unacknowledged map[string][]int = make(map[string][]int)
+			// var unacknowledgedMutex = sync.RWMutex()
+
+			unacknowledgedMutex.Lock()
+			unacknowledged[neighbor] = append(unacknowledged[neighbor], num)
+			unacknowledgedMutex.Unlock()
+
+			// Relay the broadcast to our neighbor
+			n.RPC(neighbor, msg.Body, broadcastHandlerConstructor(n, num, unacknowledged, &unacknowledgedMutex))
+		}
+
+		// Check if the source has unackd messages
+		unacknowledgedMutex.RLock()
+		var unackd []int = unacknowledged[msg.Src]
+		unacknowledgedMutex.RUnlock()
+
+		// Time to try flushing the queue
+		if len(unackd) > 0 {
+			flushUnacked(n, msg.Src, unacknowledged, &unacknowledgedMutex)
 		}
 
 		return n.Reply(msg, response)
@@ -117,4 +137,45 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// Returns broadcast reply handler
+func broadcastHandlerConstructor(n *maelstrom.Node, num int, unacknowledged map[string][]int, unacknowledgedMutex *sync.RWMutex) maelstrom.HandlerFunc {
+	return func(msg maelstrom.Message) error {
+		// Neighbor Replies back with the affirmative
+		fmt.Fprintf(os.Stderr, "Reply Src: %s Dest: %s Msg: %s\n", msg.Src, msg.Dest, msg.Body)
+
+		// Success From Dest!
+		// Depop from map
+		unacknowledgedMutex.Lock()
+		var filtered []int = make([]int, 0)
+		for _, unackNum := range unacknowledged[msg.Src] {
+			if unackNum != num {
+				filtered = append(filtered, unackNum)
+			}
+		}
+		unacknowledged[msg.Src] = filtered
+		unacknowledgedMutex.Unlock()
+
+		// Time to try flushing the queue
+		if len(filtered) > 0 {
+			flushUnacked(n, msg.Src, unacknowledged, unacknowledgedMutex)
+		}
+
+		return nil
+	}
+}
+
+func flushUnacked(n *maelstrom.Node, destNode string, unacknowledged map[string][]int, unacknowledgedMutex *sync.RWMutex) error {
+	unacknowledgedMutex.RLock()
+	var messageIds []int = unacknowledged[destNode]
+	fmt.Fprintf(os.Stderr, "Flushing %d Messages for Dest: %s\n", len(messageIds), destNode)
+	unacknowledgedMutex.RUnlock()
+	for _, num := range messageIds {
+		var msg map[string]any = make(map[string]any)
+		msg["type"] = "broadcast"
+		msg["message"] = num
+		n.RPC(destNode, msg, broadcastHandlerConstructor(n, num, unacknowledged, unacknowledgedMutex))
+	}
+	return nil
 }
