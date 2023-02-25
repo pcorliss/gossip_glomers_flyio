@@ -170,12 +170,12 @@ func flushUnacked(n *maelstrom.Node, destNode string, unacknowledged map[string]
 	unacknowledgedMutex.RLock()
 	var messageIds []int = unacknowledged[destNode]
 	fmt.Fprintf(os.Stderr, "Flushing %d Messages for Dest: %s\n", len(messageIds), destNode)
-	unacknowledgedMutex.RUnlock()
 	for _, num := range messageIds {
 		var msg map[string]any = make(map[string]any)
 		msg["type"] = "broadcast"
 		msg["message"] = num
 		n.RPC(destNode, msg, broadcastHandlerConstructor(n, num, unacknowledged, unacknowledgedMutex))
 	}
+	unacknowledgedMutex.RUnlock()
 	return nil
 }
