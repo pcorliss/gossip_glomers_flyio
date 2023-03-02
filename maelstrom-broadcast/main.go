@@ -148,21 +148,35 @@ func broadcastHandlerConstructor(n *maelstrom.Node, num int, unacknowledged map[
 func flushUnacked(n *maelstrom.Node, destNode string, unacknowledged map[string][]UnackdMsg, unacknowledgedMutex *sync.RWMutex) error {
 	unacknowledgedMutex.Lock()
 	var unackMsgs []UnackdMsg = unacknowledged[destNode]
-	fmt.Fprintf(os.Stderr, "Flushing %d Messages for Dest: %s\n", len(unackMsgs), destNode)
+	fmt.Fprintf(os.Stderr, "Unackd Messages - %d for Dest: %s\nMessages: %v\n", len(unackMsgs), destNode, unackMsgs)
 	var updatedMsgs []UnackdMsg = make([]UnackdMsg, len(unackMsgs))
-	for _, unackM := range unackMsgs {
+	var counter = 0
+	var messages []int = make([]int, 0)
+	for i, unackM := range unackMsgs {
 		// Skip sending if it hasn't yet been 100ms since sending this message
-		updatedMsgs = append(updatedMsgs, unackM)
+		updatedMsgs[i] = unackM
 		if time.Now().UnixMilli()-unackM.LastSent < 1000 {
 			continue
 		}
-		updatedMsgs[len(updatedMsgs)-1].LastSent = time.Now().UnixMilli()
+		updatedMsgs[i].LastSent = time.Now().UnixMilli()
+		counter += 1
 		var msg map[string]any = make(map[string]any)
 		msg["type"] = "broadcast"
 		msg["message"] = unackM.Message
+		messages = append(messages, unackM.Message)
 		n.RPC(destNode, msg, broadcastHandlerConstructor(n, unackM.Message, unacknowledged, unacknowledgedMutex))
 	}
 	unacknowledged[destNode] = updatedMsgs
+	fmt.Fprintf(os.Stderr, "Updated Map: %v\n", updatedMsgs)
 	unacknowledgedMutex.Unlock()
+	fmt.Fprintf(os.Stderr, "Flushed %d Messages for Dest: %s - %v\n", counter, destNode, messages)
+	var msgSet = make(map[int]bool)
+	for _, message := range messages {
+		if msgSet[message] {
+			fmt.Fprintf(os.Stderr, "Exiting: Found duplicate message in flush output, %d\n", message)
+			os.Exit(1)
+		}
+		msgSet[message] = true
+	}
 	return nil
 }
