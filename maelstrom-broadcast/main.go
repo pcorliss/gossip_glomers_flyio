@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -99,12 +100,50 @@ func main() {
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
+		// Suggested Topology is a 2D grid, but that yields results which are too slow.
+		// Need to build something with fewer hops to satisfy latency requirements
+
 		var body TopologyMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		topology = body.Topology
+		var newTopology Topology = make(Topology)
+
+		// Get list of nodes
+		nodes := make([]string, 0, len(body.Topology))
+		for k := range body.Topology {
+			nodes = append(nodes, k)
+			newTopology[k] = make([]string, 0)
+		}
+		// Need a stable sort
+		sort.Strings(nodes)
+
+		// Handles cases where length is not a perfect square
+		// var groupSize int = (int)(math.sqrt((float64)(len(nodes))-1)) + 1
+		// Group Size of 5 causes msgs-per-op that is too high. Setting this to 9 seems to give a good result
+		var groupSize = 9
+		var leaderNodes []string = make([]string, 0)
+		for i := 0; i < len(nodes); i += groupSize {
+			var n = nodes[i]
+			leaderNodes = append(leaderNodes, n)
+			for j := i + 1; j < i+groupSize && j < len(nodes); j++ {
+				var c = nodes[j]
+				newTopology[n] = append(newTopology[n], c)
+				newTopology[c] = append(newTopology[c], n)
+			}
+		}
+
+		for _, n := range leaderNodes {
+			for _, o := range leaderNodes {
+				if o != n {
+					newTopology[n] = append(newTopology[n], o)
+				}
+			}
+		}
+
+		// topology = body.Topology
+		topology = newTopology
 		fmt.Fprintf(os.Stderr, "topology: %v\n", topology)
 
 		var response map[string]string = make(map[string]string)
