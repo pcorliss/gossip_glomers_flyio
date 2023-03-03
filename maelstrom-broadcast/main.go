@@ -22,6 +22,11 @@ type TopologyMessage struct {
 	Topology Topology `json:"topology"`
 }
 
+type BatchMessage struct {
+	MsgType string `json:"type"`
+	Nums    []int  `json:"nums"`
+}
+
 func main() {
 	n := maelstrom.NewNode()
 
@@ -33,6 +38,27 @@ func main() {
 
 	var unacknowledged map[string][]UnackdMsg = make(map[string][]UnackdMsg)
 	var unacknowledgedMutex = sync.RWMutex{}
+
+	var batch []int = make([]int, 0)
+	var batchMutex = sync.RWMutex{}
+
+	n.Handle("batch", func(msg maelstrom.Message) error {
+		var body BatchMessage
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		messageMutex.Lock()
+		messages = append(messages, body.Nums...)
+		for _, n := range body.Nums {
+			if messageSet[n] {
+				continue
+			}
+			messages = append(messages, n)
+			messageSet[n] = true
+		}
+		messageMutex.Unlock()
+		return nil
+	})
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
@@ -54,6 +80,29 @@ func main() {
 		messages = append(messages, num)
 		messageSet[num] = true
 		messageMutex.Unlock()
+
+		// n0 acts as a hub and batches requests in broadcast challenge #3e
+		if n.ID() == "n0" {
+			batchMutex.Lock()
+			if len(batch) == 0 {
+				go func() {
+					time.Sleep(500 * time.Millisecond)
+					batchMutex.Lock()
+					fmt.Fprintf(os.Stderr, "Flushing Batch: %d - %v\n", len(batch), batch)
+					var batchM map[string]any = make(map[string]any)
+					batchM["type"] = "batch"
+					batchM["nums"] = batch
+					for _, dest := range topology[n.ID()] {
+						n.Send(dest, batchM)
+					}
+					batch = make([]int, 0)
+					batchMutex.Unlock()
+				}()
+			}
+			batch = append(batch, num)
+			batchMutex.Unlock()
+			return n.Reply(msg, response)
+		}
 
 		// rebroadcast to topology neighbors
 		for _, neighbor := range topology[n.ID()] {
@@ -122,11 +171,11 @@ func main() {
 		// Handles cases where length is not a perfect square
 		// var groupSize int = (int)(math.sqrt((float64)(len(nodes))-1)) + 1
 		// Group Size of 5 causes msgs-per-op that is too high. Setting this to 9 seems to give a good result
-		var groupSize = 9
-		var leaderNodes []string = make([]string, 0)
+		var groupSize = 25
+		// var leaderNodes []string = make([]string, 0)
 		for i := 0; i < len(nodes); i += groupSize {
 			var n = nodes[i]
-			leaderNodes = append(leaderNodes, n)
+			// leaderNodes = append(leaderNodes, n)
 			for j := i + 1; j < i+groupSize && j < len(nodes); j++ {
 				var c = nodes[j]
 				newTopology[n] = append(newTopology[n], c)
@@ -134,13 +183,13 @@ func main() {
 			}
 		}
 
-		for _, n := range leaderNodes {
-			for _, o := range leaderNodes {
-				if o != n {
-					newTopology[n] = append(newTopology[n], o)
-				}
-			}
-		}
+		// for _, n := range leaderNodes {
+		// 	for _, o := range leaderNodes {
+		// 		if o != n {
+		// 			newTopology[n] = append(newTopology[n], o)
+		// 		}
+		// 	}
+		// }
 
 		// topology = body.Topology
 		topology = newTopology
