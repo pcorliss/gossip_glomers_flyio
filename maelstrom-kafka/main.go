@@ -103,7 +103,7 @@ func main() {
 
 		var response map[string]any = make(map[string]any)
 		response["type"] = "list_committed_offsets_ok"
-		response["msgs"] = messages
+		response["offsets"] = messages
 		return n.Reply(msg, response)
 	})
 
