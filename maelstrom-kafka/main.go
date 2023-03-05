@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
+	"os"
+	"strconv"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -24,22 +28,113 @@ type ListOffsetsMessage struct {
 	Keys    []string `json:"keys"`
 }
 
+func mutexKey(kv maelstrom.KV, key string, lock bool) {
+	ctx := context.TODO()
+	successfulWrite := false
+	for !successfulWrite {
+		err := kv.CompareAndSwap(ctx, key+"_lock", !lock, lock, true)
+		if err != nil {
+			var lockString = "Lock"
+			if !lock {
+				lockString = "Unlock"
+			}
+			fmt.Fprintf(os.Stderr, "WARNING: %s on %s failed. Sleeping for 10ms\n", lockString, key)
+			time.Sleep(10 * time.Millisecond)
+		} else {
+			successfulWrite = true
+		}
+	}
+}
+
+func lockKey(kv maelstrom.KV, key string) {
+	mutexKey(kv, key, true)
+}
+
+func unlockKey(kv maelstrom.KV, key string) {
+	mutexKey(kv, key, false)
+}
+
+func nextOffset(kv maelstrom.KV, key string) int {
+	ctx := context.TODO()
+	offset, err := kv.ReadInt(ctx, key+"_nextOffset")
+	if err != nil {
+		return 0
+	}
+	return offset
+}
+
+func appendVal(kv maelstrom.KV, key string, val int) (int, error) {
+	ctx := context.TODO()
+
+	lockKey(kv, key)
+	offset := nextOffset(kv, key)
+
+	keyWithOffset := key + "_" + strconv.FormatInt(int64(offset), 10)
+	err := kv.Write(ctx, keyWithOffset, val)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to write %s, %d\n%v\n", keyWithOffset, val, err)
+		return 0, err
+	}
+
+	err = kv.Write(ctx, key+"_nextOffset", offset+1)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to write next offset. %s, %d\n%v\n", key, offset+1, err)
+		return 0, err
+	}
+
+	if val != offset+1 {
+		fmt.Fprintf(os.Stderr, "WARNING: Val %d and offset %d are potentially out of order for key %s\n", val, offset, key)
+	}
+
+	unlockKey(kv, key)
+	return offset, nil
+}
+
+func getVals(kv maelstrom.KV, key string, offset int) ([][]int, error) {
+	ctx := context.TODO()
+
+	vals := make([][]int, 0)
+
+	nextOffset := nextOffset(kv, key)
+
+	for o := offset; o < nextOffset; o++ {
+		keyWithOffset := key + "_" + strconv.FormatInt(int64(o), 10)
+		v, err := kv.ReadInt(ctx, keyWithOffset)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed to read offset %d for key %s\n%v\n", o, keyWithOffset, err)
+			return vals, err
+		}
+		vals = append(vals, []int{o, v})
+	}
+
+	return vals, nil
+}
+
+func getOffset(kv maelstrom.KV, key string) int {
+	ctx := context.TODO()
+	n, _ := kv.ReadInt(ctx, key+"_offset")
+	return n
+}
+
+func setOffset(kv maelstrom.KV, key string, offset int) error {
+	ctx := context.TODO()
+	return kv.Write(ctx, key+"_offset", offset)
+}
+
 func main() {
 	n := maelstrom.NewNode()
-	store := make(map[string][]int)
-	storeMutex := sync.RWMutex{}
-	commit := make(map[string]int)
-	commitMutex := sync.RWMutex{}
+	kv := maelstrom.NewLinKV(n)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body SendMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		storeMutex.Lock()
-		store[body.Key] = append(store[body.Key], body.Msg)
-		var offset int = len(store[body.Key]) - 1
-		storeMutex.Unlock()
+		offset, err := appendVal(*kv, body.Key, body.Msg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed to append val %d to %s\n", body.Msg, body.Key)
+			return err
+		}
 		var response map[string]any = make(map[string]any)
 		response["type"] = "send_ok"
 		response["offset"] = offset // Unique offset
@@ -53,19 +148,17 @@ func main() {
 		}
 		var response map[string]any = make(map[string]any)
 		response["type"] = "poll_ok"
-		storeMutex.RLock()
 
 		var messages = make(map[string][][]int)
 
 		for key, offset := range body.Offsets {
-			var m = make([][]int, 0, len(store[key][offset:]))
-			for idx, val := range store[key][offset:] {
-				m = append(m, []int{idx + offset, val})
+			var err error
+			messages[key], err = getVals(*kv, key, offset)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: failed to poll for %s, %d\n", key, offset)
+				return err
 			}
-			messages[key] = m
 		}
-
-		storeMutex.RUnlock()
 
 		response["msgs"] = messages
 		return n.Reply(msg, response)
@@ -77,11 +170,13 @@ func main() {
 			return err
 		}
 
-		commitMutex.Lock()
 		for key, offset := range body.Offsets {
-			commit[key] = offset
+			err := setOffset(*kv, key, offset)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: failed to commit offsets for %s, %d\n", key, offset)
+				return err
+			}
 		}
-		commitMutex.Unlock()
 
 		var response map[string]any = make(map[string]any)
 		response["type"] = "commit_offsets_ok"
@@ -95,11 +190,9 @@ func main() {
 		}
 
 		var messages = make(map[string]int)
-		commitMutex.RLock()
 		for _, key := range body.Keys {
-			messages[key] = commit[key]
+			messages[key] = getOffset(*kv, key)
 		}
-		commitMutex.RUnlock()
 
 		var response map[string]any = make(map[string]any)
 		response["type"] = "list_committed_offsets_ok"
