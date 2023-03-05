@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -70,7 +71,7 @@ func nextOffset(kv maelstrom.KV, key string) int {
 	return offset
 }
 
-func appendVal(kv maelstrom.KV, key string, val int) (int, error) {
+func appendVal(kv maelstrom.KV, cache map[string][]any, key string, val int) (int, error) {
 	ctx := context.TODO()
 
 	lockKey(kv, key)
@@ -100,22 +101,36 @@ func appendVal(kv maelstrom.KV, key string, val int) (int, error) {
 	return offset, nil
 }
 
-func getVals(kv maelstrom.KV, key string, offset int) ([][]int, error) {
+func getVals(kv maelstrom.KV, cache map[string][]any, key string, offset int) ([][]int, error) {
 	ctx := context.TODO()
 
 	vals := make([][]int, 0)
 
 	nextOffset := nextOffset(kv, key)
 
-	for o := offset; o < nextOffset; o++ {
-		keyWithOffset := key + "_" + strconv.FormatInt(int64(o), 10)
-		v, err := kv.ReadInt(ctx, keyWithOffset)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: failed to read offset %d for key %s\n%v\n", o, keyWithOffset, err)
-			return vals, err
-		}
-		vals = append(vals, []int{o, v})
+	newCache := cache[key]
+	if nextOffset > len(newCache) {
+		newCache = make([]any, nextOffset)
+		copy(newCache, cache[key])
+		// for idx, v := range cache[key] {
+		// 	newCache[idx] = v
+		// }
 	}
+	for o := offset; o < nextOffset; o++ {
+		if newCache[o] != nil {
+			vals = append(vals, []int{o, newCache[o].(int)})
+		} else {
+			keyWithOffset := key + "_" + strconv.FormatInt(int64(o), 10)
+			v, err := kv.ReadInt(ctx, keyWithOffset)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: failed to read offset %d for key %s\n%v\n", o, keyWithOffset, err)
+				return vals, err
+			}
+			vals = append(vals, []int{o, v})
+			newCache[o] = v
+		}
+	}
+	cache[key] = newCache
 
 	return vals, nil
 }
@@ -134,13 +149,24 @@ func setOffset(kv maelstrom.KV, key string, offset int) error {
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
+	cache := make(map[string][]any)
+	cacheMutex := sync.RWMutex{}
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body SendMessage
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		offset, err := appendVal(*kv, body.Key, body.Msg)
+		offset, err := appendVal(*kv, cache, body.Key, body.Msg)
+
+		// Update cache with new value
+		cacheMutex.Lock()
+		newCache := make([]any, offset+1)
+		copy(newCache, cache[body.Key])
+		newCache[offset] = body.Msg
+		cache[body.Key] = newCache
+		cacheMutex.Unlock()
+
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: failed to append val %d to %s\n", body.Msg, body.Key)
 			return err
@@ -163,7 +189,9 @@ func main() {
 
 		for key, offset := range body.Offsets {
 			var err error
-			messages[key], err = getVals(*kv, key, offset)
+			cacheMutex.Lock()
+			messages[key], err = getVals(*kv, cache, key, offset)
+			cacheMutex.Unlock()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: failed to poll for %s, %d\n", key, offset)
 				return err
