@@ -38,8 +38,8 @@ func mutexKey(kv maelstrom.KV, key string, lock bool) {
 			if !lock {
 				lockString = "Unlock"
 			}
-			fmt.Fprintf(os.Stderr, "WARNING: %s on %s failed. Sleeping for 10ms\n", lockString, key)
-			time.Sleep(10 * time.Millisecond)
+			fmt.Fprintf(os.Stderr, "WARNING: %s on %s failed. Sleeping for 1ms\n", lockString, key)
+			time.Sleep(1 * time.Millisecond)
 		} else {
 			successfulWrite = true
 		}
@@ -50,8 +50,15 @@ func lockKey(kv maelstrom.KV, key string) {
 	mutexKey(kv, key, true)
 }
 
-func unlockKey(kv maelstrom.KV, key string) {
-	mutexKey(kv, key, false)
+// Don't need to use the CaS operation because if we're locked we know nothing else can unlock it
+func unlockKey(kv maelstrom.KV, key string) error {
+	// mutexKey(kv, key, false)
+	ctx := context.TODO()
+	err := kv.Write(ctx, key+"_lock", false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to unlock %s", key)
+	}
+	return err
 }
 
 func nextOffset(kv maelstrom.KV, key string) int {
@@ -86,7 +93,10 @@ func appendVal(kv maelstrom.KV, key string, val int) (int, error) {
 		fmt.Fprintf(os.Stderr, "WARNING: Val %d and offset %d are potentially out of order for key %s\n", val, offset, key)
 	}
 
-	unlockKey(kv, key)
+	err = unlockKey(kv, key)
+	if err != nil {
+		return 0, err
+	}
 	return offset, nil
 }
 
