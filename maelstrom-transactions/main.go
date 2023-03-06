@@ -54,6 +54,13 @@ func main() {
 			}
 		}
 
+		for _, node := range n.NodeIDs() {
+			if node == n.ID() {
+				continue
+			}
+			n.Send(node, msg.Body)
+		}
+
 		var response map[string]any = make(map[string]any)
 		response["type"] = "txn_ok"
 		response["txn"] = txnResults
